@@ -28,41 +28,50 @@ def setup_logging(force_file: bool = False) -> None:
         os.environ.setdefault('ATLANTICO_DEVICE_CREATE_FILE', '1')
 
     rl = logging.getLogger()
+    # Clear existing handlers to prevent duplicates from libraries like absl
+    for h in rl.handlers[:]:
+        rl.removeHandler(h)
+        
     rl.setLevel(logging.INFO)
 
-    # ensure stdout stream handler
-    if not any(isinstance(h, logging.StreamHandler) and getattr(h, 'stream', None) is sys.stdout for h in rl.handlers):
+    want_file = force_file or os.environ.get('ATLANTICO_DEVICE_CREATE_FILE', '0') == '1'
+    abs_log_path = os.path.abspath(LOG_PATH) if want_file else None
+    
+    # If we are writing to a file, and that file is likely where stdout is already 
+    # going (via shell redirection), we should be careful about adding BOTH 
+    # a StreamHandler and a FileHandler.
+    
+    # Check if we are in a redirected background environment
+    is_redirected = os.environ.get('PYTHONUNBUFFERED') == '1' and os.environ.get('ATLANTICO_DEVICE_LOG')
+    
+    if want_file:
+        # create directory first
+        try:
+            os.makedirs(os.path.dirname(abs_log_path) or '.', exist_ok=True)
+        except Exception:
+            pass
+            
+        try:
+            fh = logging.FileHandler(abs_log_path)
+            fh.setFormatter(_fmt)
+            fh.setLevel(logging.INFO)
+            rl.addHandler(fh)
+        except Exception:
+            pass
+
+    # Only add StreamHandler if we aren't already writing to the same file via FileHandler
+    # OR if we aren't in a redirected background run where StreamHandler would cause 
+    # double entries in the log file because we also have a FileHandler.
+    
+    # Actually, the most robust way to avoid duplication in redirected logs is:
+    # If we added a FileHandler to X, and stdout is redirected to X, StreamHandler(stdout) 
+    # will write to X again.
+    
+    if not (want_file and is_redirected and os.path.abspath(os.environ.get('ATLANTICO_DEVICE_LOG', '')) == abs_log_path):
         sh = logging.StreamHandler(stream=sys.stdout)
         sh.setFormatter(_fmt)
         sh.setLevel(logging.INFO)
         rl.addHandler(sh)
-
-    want_file = force_file or os.environ.get('ATLANTICO_DEVICE_CREATE_FILE', '0') == '1'
-    abs_log_path = os.path.abspath(LOG_PATH)
-    if want_file:
-        # create directory first
-        try:
-            os.makedirs(os.path.dirname(LOG_PATH) or '.', exist_ok=True)
-        except Exception:
-            # best-effort: log why we couldn't create the directory
-            try:
-                logging.getLogger(__name__).debug("Failed to create log directory for %s", LOG_PATH, exc_info=True)
-            except Exception:
-                # swallow only if logging itself fails
-                pass
-        # add file handler if not already present
-        if not any(isinstance(h, logging.FileHandler) and getattr(h, 'baseFilename', None) == abs_log_path for h in rl.handlers):
-            try:
-                fh = logging.FileHandler(LOG_PATH)
-                fh.setFormatter(_fmt)
-                fh.setLevel(logging.INFO)
-                rl.addHandler(fh)
-            except Exception:
-                # best-effort: log failure to add file handler
-                try:
-                    logging.getLogger(__name__).debug("Failed to add file handler for %s", LOG_PATH, exc_info=True)
-                except Exception:
-                    pass
 
 
 __all__ = ['setup_logging', 'LOG_PATH']

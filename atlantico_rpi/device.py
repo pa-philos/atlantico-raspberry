@@ -21,11 +21,9 @@ from .mqtt_client import MQTTClient
 from .model_util import ModelUtil, ModelConfig, Model
 from .events import EventQueue
 from .logging import setup_logging, LOG_PATH
-
-setup_logging()
+from .zeroconf import listener, clear_discovery
 
 _LOG = logging.getLogger(__name__)
-_LOG.info("Logging initialized (file=%s)", LOG_PATH)
 
 # module-level singletons created by `setup()`
 _EVENT_QUEUE: Optional[EventQueue] = None
@@ -51,12 +49,154 @@ _current_round = -1
 _new_model_state = MODEL_IDLE
 _current_model_metrics = None
 _federate_model_config = None
+_selected_dataset_key = ""
+_selected_dataset_bin = ""
+_selected_dataset_meta = ""
 _PROCESS_THREAD_STARTED = False
 _PROCESS_LOCK = threading.Lock()
 
 # timing diagnostics similar to ESP32 implementation
 previousTransmit = 0
 previousConstruct = 0
+
+
+def _base_name_from_path(path: str) -> str:
+    return os.path.basename(path.rstrip("/"))
+
+
+def _sanitize_dataset_key(raw_key: str) -> str:
+    key = (raw_key or "").replace("\\", "/").strip()
+    while key.startswith("/"):
+        key = key[1:]
+    while key.endswith("/"):
+        key = key[:-1]
+    return key
+
+
+def _find_bin_file_in_dataset_folder(dataset_key: str) -> str:
+    key = _sanitize_dataset_key(dataset_key)
+    if not key:
+        return ""
+
+    # Search in multiple potential locations
+    candidates = [
+        os.path.join(".", key),
+        os.path.join("data_juliana", key),
+        os.path.join("data_ready_dataset_new", key),
+    ]
+    
+    folder = ""
+    for c in candidates:
+        if os.path.isdir(c):
+            folder = c
+            break
+    
+    if not folder:
+        # try searching for the key as a folder name anywhere under data directories
+        for root_dir in ['.', 'data_juliana', 'data_ready_dataset_new', 'data_ready']:
+            if not os.path.isdir(root_dir):
+                continue
+            for entry in os.scandir(root_dir):
+                if entry.is_dir() and entry.name == key:
+                    folder = entry.path
+                    break
+            if folder:
+                break
+    
+    if not folder:
+        return ""
+
+    # Try to find a file that matches this device's ID (e.g., raspberry01 looks for "*01.bin")
+    client_id = getattr(_MQTT_CLIENT, 'client_id', 'atlantico-pi')
+    id_suffix = "".join(filter(str.isdigit, client_id))
+    
+    first_fallback = ""
+    for entry in sorted(os.scandir(folder), key=lambda item: item.name.lower()):
+        if entry.is_file() and entry.name.lower().endswith('.bin'):
+            # Match if suffix is at end (e.g. 10.bin) or after underscore (e.g. _10.bin)
+            if id_suffix and (entry.name.lower().endswith(f"{id_suffix}.bin") or f"_{id_suffix}.bin" in entry.name.lower()):
+                _LOG.info('Found ID-matched bin in %s: %s', folder, entry.path)
+                return entry.path
+            if not first_fallback:
+                first_fallback = entry.path
+    
+    if first_fallback:
+        _LOG.info('No ID-matched bin found in %s; using first available fallback: %s', folder, first_fallback)
+    return first_fallback
+
+
+def _apply_dataset_selection(dataset_key: str = "", dataset_bin: str = "", dataset_meta: str = "") -> None:
+    global _selected_dataset_key, _selected_dataset_bin, _selected_dataset_meta
+    _selected_dataset_key = _sanitize_dataset_key(dataset_key)
+    _selected_dataset_bin = _base_name_from_path(dataset_bin) if dataset_bin else ""
+    _selected_dataset_meta = _base_name_from_path(dataset_meta) if dataset_meta else ""
+
+    if not _selected_dataset_key:
+        return
+
+    # Search for the base directory
+    # Prioritize DATA_DIR if set (assigned to this specific device)
+    data_dir = getattr(_cfg, 'DATA_DIR', '.')
+    candidates = [
+        os.path.join(data_dir, _selected_dataset_key),
+        os.path.join(".", _selected_dataset_key),
+        os.path.join("data_juliana", _selected_dataset_key),
+        os.path.join("data_ready_dataset_new", _selected_dataset_key),
+    ]
+    
+    base_dir = ""
+    for c in candidates:
+        if os.path.isdir(c):
+            base_dir = c
+            break
+            
+    if not base_dir:
+        # search for folder named dataset_key
+        for root_dir in ['.', 'data_juliana', 'data_ready_dataset_new', 'data_ready']:
+            if not os.path.isdir(root_dir):
+                continue
+            for entry in os.scandir(root_dir):
+                if entry.is_dir() and entry.name == _selected_dataset_key:
+                    base_dir = entry.path
+                    break
+            if base_dir:
+                break
+        
+    if not base_dir:
+        base_dir = os.path.join(".", _selected_dataset_key)
+
+    bin_name = _selected_dataset_bin or _base_name_from_path(X_TRAIN_PATH)
+    meta_name = _selected_dataset_meta or _base_name_from_path(Y_TRAIN_PATH)
+
+    # Resolve binary file
+    resolved_bin = os.path.join(base_dir, bin_name)
+    if not os.path.exists(resolved_bin):
+        fallback_bin = _find_bin_file_in_dataset_folder(_selected_dataset_key)
+        if fallback_bin:
+            _LOG.info('Dataset bin not found at %s; using fallback %s', resolved_bin, fallback_bin)
+            resolved_bin = fallback_bin
+
+    # Resolve metadata file
+    resolved_meta = os.path.join(base_dir, meta_name)
+    if not os.path.exists(resolved_meta):
+        # search in current folder, then parent folder
+        search_dirs = [base_dir, os.path.dirname(base_dir), "."]
+        found = False
+        for sd in search_dirs:
+            for m_name in ['metadata.json', 'y_train.csv', 'dataset.json']:
+                m_path = os.path.join(sd, m_name)
+                if os.path.exists(m_path):
+                    resolved_meta = m_path
+                    found = True
+                    break
+            if found:
+                break
+
+    _cfg.X_TRAIN_PATH = resolved_bin
+    _cfg.Y_TRAIN_PATH = resolved_meta
+    globals()['X_TRAIN_PATH'] = resolved_bin
+    globals()['Y_TRAIN_PATH'] = resolved_meta
+    _LOG.info('Selected dataset key=%s x_train=%s y_train=%s', _selected_dataset_key, resolved_bin, resolved_meta)
 
 
 def _process_model_worker():
@@ -86,7 +226,7 @@ def _process_model_worker():
                 time.sleep(0.5)
                 continue
 
-            metrics = _MODEL_UTIL.train_model_from_original_dataset(Model(), X_TRAIN_PATH, Y_TRAIN_PATH)
+            metrics = _MODEL_UTIL.train_model_from_dataset(Model(), X_TRAIN_PATH, Y_TRAIN_PATH)
             if metrics is None:
                 _LOG.warning('process_model: training returned no metrics')
                 _new_model_state = MODEL_IDLE
@@ -111,6 +251,7 @@ def _process_model_worker():
                     _LOG.info('process_model: wrote NN binary to %s', raw_path)
 
             try:
+                # time.sleep(60) # delay to allow ESP32 catch up a bit
                 send_model_to_network(None, metrics, raw_model_path=raw_path)
                 _LOG.info('process_model: sent model to network')
             except Exception:
@@ -143,8 +284,24 @@ def setup(connect: bool = False, mqtt_broker: Optional[str] = None, model_store_
     if connect:
         if mqtt_broker:
             _MQTT_CLIENT.connect(host=mqtt_broker)
+            _LOG.info('Connected to MQTT broker at %s from CLI argument', mqtt_broker)
         else:
-            _MQTT_CLIENT.connect()
+            if not listener.found_ip and not listener.found_port:
+                passed = 0
+                while passed < 30:
+                    time.sleep(1)
+                    passed += 1
+                    if listener.found_ip and listener.found_port:
+                        break
+
+            if listener.found_ip and listener.found_port:
+                _MQTT_CLIENT.connect(host=listener.found_ip, port=listener.found_port)
+                _LOG.info('Connected to MQTT broker discovered via mDNS at %s:%s', listener.found_ip, listener.found_port)
+            else:
+                _MQTT_CLIENT.connect()
+                _LOG.info('Connected to MQTT broker at default %s from mDNS timeout', MQTT_BROKER)
+
+        clear_discovery()
         _MQTT_CLIENT.loop_start()
 
     if load_device_config():
@@ -251,7 +408,17 @@ def loop(timeout: float = 0.1) -> None:
             if _cfg.DISABLE_FEDERATION:
                 return
             cfg = data.get('config')
+            dataset_key = data.get('database') or data.get('dataset') or data.get('datasetKey') or ""
+            dataset_bin = data.get('datasetBin') or ""
+            dataset_meta = data.get('datasetMeta') or ""
+            if dataset_key:
+                _apply_dataset_selection(dataset_key, dataset_bin, dataset_meta)
+            else:
+                _apply_dataset_selection()
             if cfg:
+                # Merge randomSeed into config if it exists at root
+                if 'randomSeed' in data and 'randomSeed' not in cfg:
+                    cfg['randomSeed'] = data['randomSeed']
                 _federate_model_config = cfg
             _federate_state = FEDERATE_TRAINING
             _current_round = 0
@@ -371,7 +538,7 @@ def send_model_to_network(model: Optional[Model], metrics: object, raw_model_byt
     if metrics is not None:
         # copy common scalar metrics (prefer camelCase fields)
         for key in ('meanSqrdError', 'accuracy', 'precision', 'recall', 'f1Score', 'trainingTime', 'parsingTime',
-                    'precisionWeighted', 'recallWeighted', 'f1ScoreWeighted'):
+                    'balancedAccuracy', 'balancedPrecision', 'balancedRecall', 'balancedF1Score'):
             if hasattr(metrics, key):
                 payload['metrics'][key] = getattr(metrics, key)
             elif isinstance(metrics, dict) and key in metrics:
@@ -583,7 +750,7 @@ def send_model_to_network(model: Optional[Model], metrics: object, raw_model_byt
     json_payload['timings'].setdefault('previousTransmit', previousTransmit)
 
 
-def save_device_config(path: str = CONFIGURATION_PATH) -> bool:
+def save_device_config(path: str | None = None) -> bool:
     """Persist minimal device configuration (round, federate state, model state, metrics) to JSON."""
     global _federate_state, _current_round, _new_model_state, _current_model_metrics, _federate_model_config
     # allow callers to pass None and use current CONFIGURATION_PATH
@@ -597,6 +764,12 @@ def save_device_config(path: str = CONFIGURATION_PATH) -> bool:
 
     if _federate_model_config is not None:
         payload['federateModelConfig'] = _federate_model_config
+    if _selected_dataset_key:
+        payload['datasetKey'] = _selected_dataset_key
+    if _selected_dataset_bin:
+        payload['datasetBin'] = _selected_dataset_bin
+    if _selected_dataset_meta:
+        payload['datasetMeta'] = _selected_dataset_meta
 
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     with open(path, 'w', encoding='utf-8') as f:
@@ -614,13 +787,21 @@ def load_device_config(path: str | None = None) -> bool:
             return False
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        _current_round = data.get('currentRound', -1)
-        _federate_state = data.get('federateState', FEDERATE_NONE)
-        _new_model_state = data.get('modelState', MODEL_IDLE)
-        _federate_model_config = data.get('federateModelConfig')
+        _current_round = data.get('current_round', data.get('currentRound', -1))
+        _federate_state = data.get('federate_state', data.get('federateState', FEDERATE_NONE))
+        _new_model_state = data.get('model_state', data.get('modelState', MODEL_IDLE))
+        # Reset BUSY state to IDLE on startup as the worker thread just started
+        if _new_model_state == MODEL_BUSY:
+            _new_model_state = MODEL_IDLE
+        _federate_model_config = data.get('federate_model_config', data.get('federateModelConfig'))
+        _apply_dataset_selection(
+            data.get('datasetKey', ''),
+            data.get('datasetBin', ''),
+            data.get('datasetMeta', ''),
+        )
         return True
     except Exception:
-        _LOG.exception('Failed to load device config')
+        _LOG.exception('Failed to load device config from %s', path)
         return False
 
 
@@ -708,8 +889,30 @@ def main():
         # update package config as source of truth
         try:
             _cfg.DATA_DIR = dd
-            _cfg.X_TRAIN_PATH = os.path.join(dd, 'x_train.csv')
-            _cfg.Y_TRAIN_PATH = os.path.join(dd, 'y_train.csv')
+            
+            # Check for binary dataset first
+            has_metadata = os.path.exists(os.path.join(dd, 'metadata.json'))
+            bin_files = sorted([f for f in os.listdir(dd) if f.endswith('.bin')]) if os.path.exists(dd) else []
+            
+            if has_metadata and bin_files:
+                # Prefer binary dataset if available
+                preferred_bins = ['combined_normalized.bin', 'xy_train.bin', 'xy_train_2.bin']
+                chosen_bin = None
+                for candidate in preferred_bins:
+                    candidate_path = os.path.join(dd, candidate)
+                    if os.path.exists(candidate_path):
+                        chosen_bin = candidate
+                        break
+                if chosen_bin is None:
+                    chosen_bin = bin_files[0]
+
+                _cfg.X_TRAIN_PATH = os.path.join(dd, chosen_bin)
+                _cfg.Y_TRAIN_PATH = os.path.join(dd, 'metadata.json')
+                _LOG.info("Auto-configured binary dataset: %s", _cfg.X_TRAIN_PATH)
+            else:
+                _cfg.X_TRAIN_PATH = os.path.join(dd, 'x_train.csv')
+                _cfg.Y_TRAIN_PATH = os.path.join(dd, 'y_train.csv')
+
             _cfg.X_TEST_PATH = os.path.join(dd, 'x_test.csv')
             _cfg.Y_TEST_PATH = os.path.join(dd, 'y_test.csv')
             _cfg.CONFIGURATION_PATH = os.path.join(dd, 'config.json')

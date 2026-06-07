@@ -13,8 +13,15 @@ DEVICE_MODULE="atlantico_rpi.device"
 
 PID_DIR="$REPO_ROOT/run/pids"
 LOG_DIR="$REPO_ROOT/run/logs"
-PID_FILE="$PID_DIR/device.pid"
-LOG_FILE="$LOG_DIR/device.log"
+
+DEVICE_INSTANCE="${DEVICE_INSTANCE:-}"
+if [ -n "$DEVICE_INSTANCE" ]; then
+    PID_FILE="$PID_DIR/device_${DEVICE_INSTANCE}.pid"
+    LOG_FILE="$LOG_DIR/device_${DEVICE_INSTANCE}.log"
+else
+    PID_FILE="$PID_DIR/device.pid"
+    LOG_FILE="$LOG_DIR/device.log"
+fi
 
 mkdir -p "$PID_DIR" "$LOG_DIR"
 
@@ -25,6 +32,10 @@ start_background() {
   fi
 
   echo "Starting device in background (module: $DEVICE_MODULE)"
+  # Set environment variables for unbuffered output and specific log file
+  export PYTHONUNBUFFERED=1
+  export ATLANTICO_DEVICE_LOG="$LOG_FILE"
+  
   if [ -x "$VENV_PY" ]; then
     nohup "$VENV_PY" -m "$DEVICE_MODULE" "$@" >>"$LOG_FILE" 2>&1 &
   else

@@ -48,9 +48,10 @@ class MultiClassClassifierMetrics:
     precision: float = 0.0
     recall: float = 0.0
     f1Score: float = 0.0
-    precisionWeighted: float = 0.0
-    recallWeighted: float = 0.0
-    f1ScoreWeighted: float = 0.0
+    balancedAccuracy: float = 0.0
+    balancedPrecision: float = 0.0
+    balancedRecall: float = 0.0
+    balancedF1Score: float = 0.0
 
 
 class ModelConfig:
@@ -140,6 +141,13 @@ class ModelUtil:
 
         raise NotImplementedError("Unsupported stream type for transform_data_to_model")
 
+    def train_model_from_dataset(self, model: Model, x_file: str, y_file: str) -> MultiClassClassifierMetrics:
+        """Train a model using the specified dataset type and files. Returns metrics."""
+        if x_file.endswith('.bin') and y_file.endswith('.json'):
+            return self.train_model_from_binary_dataset(model, x_file, y_file)
+        else:
+            return self.train_model_from_original_dataset(model, x_file, y_file)
+
     def train_model_from_original_dataset(self, model: Model, x_file: str, y_file: str) -> MultiClassClassifierMetrics:
         """Train a model using files `x_file` and `y_file`. Returns metrics."""
         metrics = MultiClassClassifierMetrics()
@@ -192,8 +200,19 @@ class ModelUtil:
             X = X[:m]
             y = y[:m]
 
+        return self._train_on_data(X, y)
+
+    def _train_on_data(self, X: np.ndarray, y: np.ndarray) -> MultiClassClassifierMetrics:
+        """Internal: Train a fresh model on X, y using current config."""
+        metrics = MultiClassClassifierMetrics()
+        metrics.parsingTime = 0
+        metrics.trainingTime = 0
+        metrics.epochs = self.config.epochs
         metrics.datasetSize = int(X.shape[0])
 
+        if tf is None:
+            return metrics
+            
         keras = getattr(tf, 'keras', None)
         if keras is None:
             _LOG.debug('TensorFlow keras not available despite tf import; returning placeholder metrics')
@@ -217,10 +236,14 @@ class ModelUtil:
         # Determine architecture: accept full-arch (including input) or hidden+output sizes
         cfg_layers = getattr(self.config, 'layers', None) or []
         if isinstance(cfg_layers, (list, tuple)) and len(cfg_layers) >= 2:
-            if int(cfg_layers[0]) == int(input_dim):
-                arch = [int(x) for x in cfg_layers]
-            else:
-                arch = [int(input_dim)] + [int(x) for x in cfg_layers]
+            arch = [int(x) for x in cfg_layers]
+            if int(cfg_layers[0]) != int(input_dim):
+                _LOG.warning(
+                    "Input data dim %s does not match config `layers[0]` %s. Replacing the input layer size with the dataset width.",
+                    input_dim,
+                    cfg_layers[0],
+                )
+                arch[0] = int(input_dim)
         else:
             arch = [int(input_dim)] + [int(x) for x in (getattr(self.config, 'layers') or [10, 10])]
 
@@ -304,7 +327,7 @@ class ModelUtil:
         metrics.numberOfClasses = n_classes
         metrics.metrics = [ClassClassifierMetrics() for _ in range(n_classes)]
 
-        # confusion counts
+        # per-class confusion counts
         for i in range(y_true_labels.shape[0]):
             t = int(y_true_labels[i])
             p = int(y_pred_labels[i])
@@ -318,30 +341,7 @@ class ModelUtil:
                 else:
                     metrics.metrics[c].trueNegatives += 1
 
-        # sample-level accuracy
-        metrics.accuracy = float(np.mean(y_pred_labels == y_true_labels)) if y_true_labels.size > 0 else 0.0
-
-        # per-class precision/recall/f1 and aggregated metrics
-        precisions = []
-        recalls = []
-        f1s = []
-        for c in range(n_classes):
-            tp = metrics.metrics[c].truePositives
-            fp = metrics.metrics[c].falsePositives
-            fn = metrics.metrics[c].falseNegatives
-            prec = (tp / (tp + fp)) if (tp + fp) > 0 else 0.0
-            rec = (tp / (tp + fn)) if (tp + fn) > 0 else 0.0
-            f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
-            precisions.append(prec)
-            recalls.append(rec)
-            f1s.append(f1)
-
-        metrics.precision = float(sum(precisions) / len(precisions)) if precisions else 0.0
-        metrics.recall = float(sum(recalls) / len(recalls)) if recalls else 0.0
-        metrics.f1Score = float(sum(f1s) / len(f1s)) if f1s else 0.0
-
-        # keep mean_squared_error already assigned from training history
-        compute_weighted_metrics(metrics)
+        compute_all_metrics(metrics)
         return metrics
 
     def export_tflite(self, keras_model: Any, tflite_path: str) -> bool:
@@ -514,42 +514,340 @@ class ModelUtil:
         length = len(x)
         return [0 for _ in range(length)]
 
+    def train_model_from_binary_dataset(self, model: Model, bin_file: str, meta_file: str) -> MultiClassClassifierMetrics:
+        """Train a model reading from a binary dataset (ESP32 format) + metadata JSON."""
+        if self._looks_like_juliana_dataset(meta_file):
+            return self.train_model_from_juliana_binary_dataset(model, bin_file, meta_file)
 
-def compute_weighted_metrics(metrics: MultiClassClassifierMetrics) -> None:
-    """Compute support-weighted precision/recall/f1 in-place."""
+        metrics = MultiClassClassifierMetrics()
+        metrics.parsingTime = 0
+        metrics.trainingTime = 0
+        metrics.epochs = self.config.epochs
+
+        if tf is None:
+            _LOG.warning("TensorFlow not available; cannot train from binary dataset.")
+            return metrics
+
+        if not os.path.exists(bin_file):
+            _LOG.error("Binary file not found: %s", bin_file)
+            return metrics
+        if not os.path.exists(meta_file):
+            _LOG.error("Metadata file not found: %s", meta_file)
+            return metrics
+        
+        start_parse = time.time()
+        
+        # Load Metadata
+        with open(meta_file, 'r', encoding='utf-8') as f:
+            meta = json.load(f)
+        
+        schema = meta.get('schema', [])
+        label_col_name = meta.get('label_column', 'activityID')
+        label_values = meta.get('label_values', [])
+        label_map = meta.get('label_map', None)
+        bytes_per_row = meta.get('bytes_per_row', None)
+        
+        # Calculate row size if not provided
+        if bytes_per_row is None:
+            bytes_per_row = sum(int(c.get('bytes', 0)) for c in schema)
+            
+        TYPE_TO_STRUCT = {
+            'int8': ('b', 1),
+            'uint8': ('B', 1),
+            'int32': ('<i', 4),
+            'float32': ('<f', 4),
+        }
+        
+        # Prepare parse columns
+        parse_cols = []
+        label_col_info = None
+        timestamp_cols = {'timestamp'}
+        
+        for c in schema:
+            name = c['name']
+            t = c['type']
+            offset = int(c['offset'])
+            b = int(c['bytes'])
+            
+            if t not in TYPE_TO_STRUCT:
+                _LOG.warning("Unsupported type in schema: %s", t)
+                continue
+                
+            fmt = TYPE_TO_STRUCT[t][0]
+            parse_cols.append((name, t, offset, b, fmt))
+            
+            if name == label_col_name:
+                label_col_info = (name, t, offset, b, fmt)
+            
+        if label_col_info is None:
+            _LOG.error("Label column '%s' not found in schema.", label_col_name)
+            return metrics
+
+        # Parse Binary File
+        X_list = []
+        y_list = []
+        
+        with open(bin_file, 'rb') as f:
+            while True:
+                row = f.read(bytes_per_row)
+                if not row or len(row) < bytes_per_row:
+                    break
+                
+                # Parse Label
+                l_name, l_type, l_offset, l_bytes, l_fmt = label_col_info
+                try:
+                    val = struct.unpack_from(l_fmt, row, l_offset)[0]
+                except struct.error:
+                    val = 0
+                label_raw = int(val)
+                
+                # Handle encoded vs original labels
+                label_idx = -1
+                if label_map is not None:
+                    # Encoded labels: 1-based index (0 = no label)
+                    if label_raw == 0:
+                        continue # Skip unlabeled
+                    label_idx = label_raw - 1
+                else:
+                    # Original labels: need to map via label_values
+                    if label_raw in label_values:
+                        try:
+                            label_idx = label_values.index(label_raw)
+                        except ValueError:
+                            continue
+                    else:
+                        continue # Label not in known values
+                
+                if label_idx < 0:
+                    continue
+                
+                # Parse Features
+                feats = []
+                for (name, t, offset, b, fmt) in parse_cols:
+                    if name == label_col_name or name in timestamp_cols:
+                        continue
+                    try:
+                        val = struct.unpack_from(fmt, row, offset)[0]
+                        feats.append(float(val))
+                    except struct.error:
+                        feats.append(0.0)
+                
+                X_list.append(feats)
+                y_list.append(label_idx)
+
+        metrics.parsingTime = float(time.time() - start_parse)
+        
+        n_samples = len(X_list)
+        if n_samples == 0:
+            _LOG.warning("No valid samples found in binary dataset.")
+            return metrics
+            
+        X = np.array(X_list, dtype=np.float32)
+        y_indices = np.array(y_list, dtype=np.int32)
+        
+        # Convert y to one-hot if needed, based on number of classes
+        # Generally _train_on_data expects y to be shaped (N, num_classes) or (N, 1) or (N,)
+        # The original code handled one-hot detection.
+        # But here we know the class index. Let's make it one-hot to be consistent with
+        # typical neural net training if we are doing multi-class.
+        
+        # Check num classes from model config or data
+        # If we have label_values, that dictates num classes.
+        if label_values:
+            num_classes = len(label_values)
+        elif label_map:
+             # Assuming label_map is Dict[Original, Encoded]. Max encoded value gives size.
+             # but actually just max(y_indices) + 1 is a safe bet for now if dynamic.
+            num_classes = max(y_indices) + 1 if len(y_indices) > 0 else 0
+        else:
+             num_classes = max(y_indices) + 1 if len(y_indices) > 0 else 0
+             
+        # Create one-hot Y
+        if num_classes > 1:
+            y_one_hot = np.zeros((n_samples, num_classes), dtype=np.float32)
+            # Use fancy indexing
+            # Clip indices just in case
+            y_indices = np.clip(y_indices, 0, num_classes - 1)
+            y_one_hot[np.arange(n_samples), y_indices] = 1.0
+            y = y_one_hot
+        else:
+            y = y_indices.reshape((-1, 1)).astype(np.float32)
+            
+        return self._train_on_data(X, y)
+
+    def train_model_from_juliana_binary_dataset(self, model: Model, bin_file: str, meta_file: str) -> MultiClassClassifierMetrics:
+        """Train a model reading the Juliana binary dataset produced from `data_juliana`."""
+        metrics = MultiClassClassifierMetrics()
+        metrics.parsingTime = 0
+        metrics.trainingTime = 0
+        metrics.epochs = self.config.epochs
+
+        if tf is None:
+            _LOG.warning('TensorFlow not available; cannot train from Juliana binary dataset.')
+            return metrics
+
+        if not os.path.exists(bin_file):
+            _LOG.error('Binary file not found: %s', bin_file)
+            return metrics
+        if not os.path.exists(meta_file):
+            _LOG.error('Metadata file not found: %s', meta_file)
+            return metrics
+
+        start_parse = time.time()
+
+        with open(meta_file, 'r', encoding='utf-8') as f:
+            meta = json.load(f)
+
+        schema = meta.get('schema', [])
+        label_col_name = meta.get('label_column', 'ocupada')
+        if label_col_name != 'ocupada':
+            _LOG.warning("Juliana trainer received unexpected label column '%s'; falling back to generic binary trainer.", label_col_name)
+            return self.train_model_from_binary_dataset(model, bin_file, meta_file)
+
+        bytes_per_row = meta.get('bytes_per_row', None)
+        if bytes_per_row is None:
+            bytes_per_row = sum(int(c.get('bytes', 0)) for c in schema)
+
+        type_to_struct = {
+            'int8': ('b', 1),
+            'uint8': ('B', 1),
+            'int32': ('<i', 4),
+            'float32': ('<f', 4),
+        }
+
+        parse_cols = []
+        label_col_info = None
+        for c in schema:
+            name = c['name']
+            col_type = c['type']
+            offset = int(c['offset'])
+            bytes_count = int(c['bytes'])
+            if col_type not in type_to_struct:
+                _LOG.warning('Unsupported type in Juliana schema: %s', col_type)
+                continue
+            fmt = type_to_struct[col_type][0]
+            parse_cols.append((name, col_type, offset, bytes_count, fmt))
+            if name == label_col_name:
+                label_col_info = (name, col_type, offset, bytes_count, fmt)
+
+        if label_col_info is None:
+            _LOG.error("Label column '%s' not found in Juliana schema.", label_col_name)
+            return metrics
+
+        x_list = []
+        y_list = []
+
+        with open(bin_file, 'rb') as f:
+            while True:
+                row = f.read(bytes_per_row)
+                if not row or len(row) < bytes_per_row:
+                    break
+
+                _, label_type, label_offset, _, label_fmt = label_col_info
+                try:
+                    label_val = struct.unpack_from(label_fmt, row, label_offset)[0]
+                except struct.error:
+                    label_val = 0
+
+                label_idx = 1 if int(label_val) != 0 else 0
+
+                feats = []
+                for name, col_type, offset, _, fmt in parse_cols:
+                    if name == label_col_name:
+                        continue
+                    try:
+                        value = struct.unpack_from(fmt, row, offset)[0]
+                        feats.append(float(value))
+                    except struct.error:
+                        feats.append(0.0)
+
+                x_list.append(feats)
+                y_list.append(label_idx)
+
+        metrics.parsingTime = float(time.time() - start_parse)
+
+        if not x_list:
+            _LOG.warning('No valid samples found in Juliana binary dataset.')
+            return metrics
+
+        X = np.array(x_list, dtype=np.float32)
+        y_indices = np.array(y_list, dtype=np.int32)
+
+        num_classes = 2
+        y = np.zeros((len(y_indices), num_classes), dtype=np.float32)
+        y[np.arange(len(y_indices)), np.clip(y_indices, 0, num_classes - 1)] = 1.0
+
+        return self._train_on_data(X, y)
+
+    def _looks_like_juliana_dataset(self, meta_file: str) -> bool:
+        try:
+            if not os.path.exists(meta_file):
+                return False
+            with open(meta_file, 'r', encoding='utf-8') as f:
+                meta = json.load(f)
+            return meta.get('label_column') == 'ocupada'
+        except Exception:
+            _LOG.debug('Failed to inspect metadata file for Juliana dataset', exc_info=True)
+            return False
+
+
+
+def compute_all_metrics(metrics: MultiClassClassifierMetrics) -> None:
+    """Consolidated metrics calculation (Macro, Weighted, and Balanced).
+    
+    This matches the logic in the ESP32 ModelUtil.h, where 'balanced' metrics
+    are support-weighted averages of per-class binary metrics.
+    """
     if metrics is None or metrics.metrics is None or metrics.numberOfClasses == 0:
         return
 
-    supports = []
+    n = metrics.numberOfClasses
+    total_samples = metrics.datasetSize
+
     precisions = []
     recalls = []
     f1s = []
-    total_support = 0
-    for c in range(metrics.numberOfClasses):
+    accuracies = []
+    supports = []
+
+    for c in range(n):
         m = metrics.metrics[c]
         tp = m.truePositives
         fp = m.falsePositives
+        tn = m.trueNegatives
         fn = m.falseNegatives
+        
         support = tp + fn
         supports.append(support)
-        total_support += support
+        
+        # Per-class metrics
+        total_class = tp + tn + fp + fn
+        acc = (tp + tn) / total_class if total_class > 0 else 0.0
         prec = (tp / (tp + fp)) if (tp + fp) > 0 else 0.0
         rec = (tp / (tp + fn)) if (tp + fn) > 0 else 0.0
         f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+        
+        accuracies.append(acc)
         precisions.append(prec)
         recalls.append(rec)
         f1s.append(f1)
 
-    metrics.precision = float(sum(precisions) / len(precisions)) if precisions else 0.0
-    metrics.recall = float(sum(recalls) / len(recalls)) if recalls else 0.0
-    metrics.f1Score = float(sum(f1s) / len(f1s)) if f1s else 0.0
+    # 1. Macro Averaged (Simple average of per-class metrics)
+    metrics.accuracy = float(sum(accuracies) / n)
+    metrics.precision = float(sum(precisions) / n)
+    metrics.recall = float(sum(recalls) / n)
+    metrics.f1Score = float(sum(f1s) / n)
 
-    if total_support > 0:
-        metrics.precisionWeighted = float(sum(p * s for p, s in zip(precisions, supports)) / total_support)
-        metrics.recallWeighted = float(sum(r * s for r, s in zip(recalls, supports)) / total_support)
-        metrics.f1ScoreWeighted = float(sum(f * s for f, s in zip(f1s, supports)) / total_support)
+    # 2. Support-Weighted Metrics
+    if total_samples > 0:
+        # These are what the ESP32 project calls 'balanced' metrics
+        metrics.balancedAccuracy = float(sum(a * s for a, s in zip(accuracies, supports)) / total_samples)
+        metrics.balancedPrecision = float(sum(p * s for p, s in zip(precisions, supports)) / total_samples)
+        metrics.balancedRecall = float(sum(r * s for r, s in zip(recalls, supports)) / total_samples)
+        metrics.balancedF1Score = float(sum(f * s for f, s in zip(f1s, supports)) / total_samples)
     else:
-        metrics.precisionWeighted = metrics.precision
-        metrics.recallWeighted = metrics.recall
-        metrics.f1ScoreWeighted = metrics.f1Score
+        metrics.balancedAccuracy = metrics.accuracy
+        metrics.balancedPrecision = metrics.precision
+        metrics.balancedRecall = metrics.recall
+        metrics.balancedF1Score = metrics.f1Score
 

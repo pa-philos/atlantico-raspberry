@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone test runner that invokes train_model_from_original_dataset
+"""Standalone test runner that invokes train_model_from_dataset
 and writes JSON metrics to run/logs.
 """
 import argparse
@@ -57,7 +57,7 @@ def main():
 
     try:
         print('Using X_TRAIN_PATH=', X_TRAIN_PATH, 'Y_TRAIN_PATH=', Y_TRAIN_PATH)
-        metrics = util.train_model_from_original_dataset(m, X_TRAIN_PATH, Y_TRAIN_PATH)
+        metrics = util.train_model_from_dataset(m, X_TRAIN_PATH, Y_TRAIN_PATH)
         out = metrics_to_dict(metrics)
         out['timestamp'] = time.time()
 

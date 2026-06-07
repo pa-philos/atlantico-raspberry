@@ -17,7 +17,7 @@ def test_train_and_export_tflite(tmp_path):
     cfg = ModelConfig(layers=[4], activation_functions=[0], epochs=2)
     mu = ModelUtil(cfg)
 
-    metrics = mu.train_model_from_original_dataset(Model(), str(x_file), str(y_file))
+    metrics = mu.train_model_from_dataset(Model(), str(x_file), str(y_file))
     # metrics should be returned even if TF is not available (then defaults)
     assert hasattr(metrics, 'epochs')
 

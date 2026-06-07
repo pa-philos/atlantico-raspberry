@@ -25,7 +25,7 @@ def test_train_and_predict():
     cfg = ModelConfig(layers=[1], activation_functions=[0], epochs=3)
     mu = ModelUtil(cfg)
     m = Model()
-    metrics = mu.train_model_from_original_dataset(m, "x.csv", "y.csv")
+    metrics = mu.train_model_from_dataset(m, "x.csv", "y.csv")
     assert metrics.epochs == 3
     preds = mu.predict_from_current_model(m, [1, 2, 3])
     assert preds == [0, 0, 0]

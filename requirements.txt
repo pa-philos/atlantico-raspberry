@@ -3,3 +3,4 @@ paho-mqtt>=2.1.0
 numpy>=2.3.0
 tensorflow>=2.20.0
 pytest>=8.4.2
+zeroconf>=0.148.0

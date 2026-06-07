@@ -151,7 +151,17 @@ class MQTTClient:
         else:
             _LOG.warning("MQTT on_connect rc=%s", rc)
 
-    def _on_disconnect(self, client, userdata, rc, properties=None):
+    def _on_disconnect(self, client, userdata, *args, **kwargs):
+        # Handle both v1 and v2 Callback API signatures
+        # v1: client, userdata, rc
+        # v2: client, userdata, disconnect_flags, reason_code, properties
+        if len(args) >= 2:
+            rc = args[1]
+        elif len(args) == 1:
+            rc = args[0]
+        else:
+            rc = kwargs.get('reason_code', kwargs.get('rc', 0))
+
         _LOG.warning("MQTT disconnected (rc=%s)", rc)
         self._connected = False
         if rc != 0 and not self._should_stop.is_set():
