@@ -1,0 +1,1 @@
+{"currentRound": -1, "federateState": "NONE", "modelState": "IDLE", "federateModelConfig": {"layers": [10, 50, 25, 12, 6, 1], "actvFunctions": [1, 1, 1, 1, 0], "epochs": 1, "learningRateOfWeights": 0.025, "learningRateOfBiases": 0.005, "randomSeed": 42, "jsonWeights": false}, "datasetKey": "shards_5"}
