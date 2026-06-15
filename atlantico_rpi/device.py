@@ -170,17 +170,19 @@ def _apply_dataset_selection(dataset_key: str = "", dataset_bin: str = "", datas
 
     # Resolve binary file
     resolved_bin = os.path.join(base_dir, bin_name)
+    bin_folder = base_dir
     if not os.path.exists(resolved_bin):
         fallback_bin = _find_bin_file_in_dataset_folder(_selected_dataset_key)
         if fallback_bin:
             _LOG.info('Dataset bin not found at %s; using fallback %s', resolved_bin, fallback_bin)
             resolved_bin = fallback_bin
+            bin_folder = os.path.dirname(resolved_bin)
 
     # Resolve metadata file
     resolved_meta = os.path.join(base_dir, meta_name)
-    if not os.path.exists(resolved_meta):
-        # search in current folder, then parent folder
-        search_dirs = [base_dir, os.path.dirname(base_dir), "."]
+    if not os.path.exists(resolved_meta) or bin_folder != base_dir:
+        # search in bin_folder, then its parent, then base_dir, then current dir
+        search_dirs = [bin_folder, os.path.dirname(bin_folder), base_dir, "."]
         found = False
         for sd in search_dirs:
             for m_name in ['metadata.json', 'y_train.csv', 'dataset.json']:

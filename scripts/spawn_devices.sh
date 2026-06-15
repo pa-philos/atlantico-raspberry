@@ -23,8 +23,8 @@ fi
 # Configuration: Array of device names to spawn
 # Modify this array to change the number or names of devices
 DEVICE_NAMES=(
-    "rasp_6"
-    "rasp_7"
+#    "rasp_6"
+#    "rasp_7"
     "rasp_8"
     "rasp_9"
     "rasp_10"

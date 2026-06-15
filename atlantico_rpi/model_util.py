@@ -143,7 +143,7 @@ class ModelUtil:
 
     def train_model_from_dataset(self, model: Model, x_file: str, y_file: str) -> MultiClassClassifierMetrics:
         """Train a model using the specified dataset type and files. Returns metrics."""
-        if x_file.endswith('.bin') and y_file.endswith('.json'):
+        if x_file.endswith('.bin'):
             return self.train_model_from_binary_dataset(model, x_file, y_file)
         else:
             return self.train_model_from_original_dataset(model, x_file, y_file)
