@@ -218,6 +218,13 @@ class ModelUtil:
             _LOG.debug('TensorFlow keras not available despite tf import; returning placeholder metrics')
             return metrics
 
+        # Clear any old Keras models from memory and invoke garbage collection
+        # to prevent memory leaks across multiple federated learning rounds.
+        keras.backend.clear_session()
+        import gc
+        gc.collect()
+        self._last_trained_tf_model = None
+
         model_tf = keras.Sequential()
         input_dim = X.shape[1]
         model_tf.add(keras.Input(shape=(input_dim,)))
