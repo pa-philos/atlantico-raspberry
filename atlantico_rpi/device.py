@@ -258,6 +258,13 @@ def _process_model_worker():
                 _LOG.info('process_model: sent model to network')
             except Exception:
                 _LOG.exception('process_model: failed to send model to network')
+            finally:
+                if raw_path and os.path.exists(raw_path):
+                    try:
+                        os.remove(raw_path)
+                        _LOG.info('process_model: deleted temporary NN binary %s', raw_path)
+                    except Exception as e:
+                        _LOG.warning('process_model: failed to delete temporary NN binary: %s', e)
 
             _new_model_state = MODEL_IDLE
             save_device_config()
@@ -372,7 +379,7 @@ def loop(timeout: float = 0.1) -> None:
 
         os.makedirs(_RAW_MODEL_DIR, exist_ok=True)
         client_suffix = getattr(_MQTT_CLIENT, 'client_id', 'atlantico-pi')
-        filename = os.path.join(_RAW_MODEL_DIR, f"{_current_round}-{client_suffix}.nn")
+        filename = os.path.join(_RAW_MODEL_DIR, f"latest-{client_suffix}.nn")
         with open(filename, 'wb') as f:
             f.write(data_bytes)
         _LOG.info('Saved received raw model to %s', filename)
