@@ -10,10 +10,16 @@ import struct
 from .config import X_TRAIN_PATH, Y_TRAIN_PATH
 import logging
 
-try:
-    import tensorflow as tf
-except Exception:
-    tf = None
+tf = None
+
+def _lazy_import_tf():
+    global tf
+    if tf is None:
+        try:
+            import tensorflow as _tf
+            tf = _tf
+        except Exception:
+            pass
 
 _LOG = logging.getLogger(__name__)
 
@@ -204,6 +210,7 @@ class ModelUtil:
 
     def _train_on_data(self, X: np.ndarray, y: np.ndarray) -> MultiClassClassifierMetrics:
         """Internal: Train a fresh model on X, y using current config."""
+        _lazy_import_tf()
         metrics = MultiClassClassifierMetrics()
         metrics.parsingTime = 0
         metrics.trainingTime = 0
@@ -353,6 +360,7 @@ class ModelUtil:
 
     def export_tflite(self, keras_model: Any, tflite_path: str) -> bool:
         """Convert a Keras model to TFLite and write to `tflite_path`."""
+        _lazy_import_tf()
         if tf is None:
             raise RuntimeError("TensorFlow is not available in this environment")
         converter = tf.lite.TFLiteConverter.from_keras_model(keras_model)
@@ -523,6 +531,7 @@ class ModelUtil:
 
     def train_model_from_binary_dataset(self, model: Model, bin_file: str, meta_file: str) -> MultiClassClassifierMetrics:
         """Train a model reading from a binary dataset (ESP32 format) + metadata JSON."""
+        _lazy_import_tf()
         if self._looks_like_juliana_dataset(meta_file):
             return self.train_model_from_juliana_binary_dataset(model, bin_file, meta_file)
 
@@ -684,6 +693,7 @@ class ModelUtil:
 
     def train_model_from_juliana_binary_dataset(self, model: Model, bin_file: str, meta_file: str) -> MultiClassClassifierMetrics:
         """Train a model reading the Juliana binary dataset produced from `data_juliana`."""
+        _lazy_import_tf()
         metrics = MultiClassClassifierMetrics()
         metrics.parsingTime = 0
         metrics.trainingTime = 0

@@ -221,14 +221,91 @@ def _process_model_worker():
                 _new_model_state = MODEL_BUSY
                 save_device_config()
 
-            if _MODEL_UTIL is None:
-                _LOG.warning('process_model: no ModelUtil configured; skipping training')
+            cfg = getattr(_MODEL_UTIL, 'config', None)
+            if cfg is None:
+                _LOG.warning('process_model: no ModelConfig configured; skipping training')
                 _new_model_state = MODEL_IDLE
                 save_device_config()
                 time.sleep(0.5)
                 continue
 
-            metrics = _MODEL_UTIL.train_model_from_dataset(Model(), X_TRAIN_PATH, Y_TRAIN_PATH)
+            import subprocess
+            from atlantico_rpi.model_util import MultiClassClassifierMetrics, ClassClassifierMetrics
+
+            # Serialize config to JSON to pass to subprocess
+            cfg_dict = {
+                'layers': list(cfg.layers),
+                'activation_functions': list(cfg.activation_functions),
+                'epochs': int(cfg.epochs),
+                'random_seed': int(cfg.random_seed),
+                'learning_rate_of_weights': float(cfg.learning_rate_of_weights),
+                'learning_rate_of_biases': float(cfg.learning_rate_of_biases),
+                'json_weights': bool(cfg.json_weights)
+            }
+            cfg_json = json.dumps(cfg_dict)
+
+            # Temp paths for weights and metrics
+            os.makedirs(_RAW_MODEL_DIR, exist_ok=True)
+            temp_weights_path = os.path.join(_RAW_MODEL_DIR, f"tmp_weights_{int(time.time())}_{uuid.uuid4().hex}.nn")
+            temp_metrics_path = os.path.join(_RAW_MODEL_DIR, f"tmp_metrics_{int(time.time())}_{uuid.uuid4().hex}.json")
+
+            cmd = [
+                sys.executable,
+                '-m', 'atlantico_rpi.train_runner',
+                '--x-file', X_TRAIN_PATH,
+                '--y-file', Y_TRAIN_PATH,
+                '--config-json', cfg_json,
+                '--output-metrics', temp_metrics_path,
+                '--output-weights', temp_weights_path
+            ]
+
+            _LOG.info('process_model: starting training in subprocess')
+            proc_start = time.time()
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            proc_duration = time.time() - proc_start
+
+            if res.returncode != 0:
+                _LOG.error('process_model: training subprocess failed with code %d', res.returncode)
+                _LOG.error('process_model: stdout: %s', res.stdout)
+                _LOG.error('process_model: stderr: %s', res.stderr)
+                _new_model_state = MODEL_IDLE
+                save_device_config()
+                time.sleep(0.5)
+                continue
+
+            _LOG.info('process_model: training subprocess finished successfully in %.2fs', proc_duration)
+
+            # Load metrics
+            metrics = None
+            if os.path.exists(temp_metrics_path):
+                try:
+                    with open(temp_metrics_path, 'r') as f:
+                        m_data = json.load(f)
+                    metrics = MultiClassClassifierMetrics()
+                    for k, v in m_data.items():
+                        if k == 'metrics':
+                            cm_list = []
+                            for cm_data in v:
+                                cm = ClassClassifierMetrics(
+                                    truePositives=cm_data.get('truePositives', 0),
+                                    trueNegatives=cm_data.get('trueNegatives', 0),
+                                    falsePositives=cm_data.get('falsePositives', 0),
+                                    falseNegatives=cm_data.get('falseNegatives', 0),
+                                )
+                                cm_list.append(cm)
+                            metrics.metrics = cm_list
+                        else:
+                            setattr(metrics, k, v)
+                except Exception as e:
+                    _LOG.exception('process_model: failed to read/parse metrics JSON: %s', e)
+
+            # Clean up temp metrics path
+            if os.path.exists(temp_metrics_path):
+                try:
+                    os.remove(temp_metrics_path)
+                except Exception:
+                    pass
+
             if metrics is None:
                 _LOG.warning('process_model: training returned no metrics')
                 _new_model_state = MODEL_IDLE
@@ -241,16 +318,7 @@ def _process_model_worker():
             save_device_config()
             _LOG.info('process_model: training complete (metrics=%s)', getattr(metrics, '__dict__', metrics))
 
-            raw_path = None
-            tf_model = getattr(_MODEL_UTIL, '_last_trained_tf_model', None)
-            if tf_model is not None:
-                raw_bytes = _MODEL_UTIL.serialize_to_nn_bytes(keras_model=tf_model)
-                if raw_bytes:
-                    os.makedirs(_RAW_MODEL_DIR, exist_ok=True)
-                    raw_path = os.path.join(_RAW_MODEL_DIR, f"{int(time.time())}-{uuid.uuid4().hex}.nn")
-                    with open(raw_path, 'wb') as rf:
-                        rf.write(raw_bytes)
-                    _LOG.info('process_model: wrote NN binary to %s', raw_path)
+            raw_path = temp_weights_path if os.path.exists(temp_weights_path) else None
 
             try:
                 # time.sleep(60) # delay to allow ESP32 catch up a bit
