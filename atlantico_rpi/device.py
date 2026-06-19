@@ -54,6 +54,9 @@ _selected_dataset_bin = ""
 _selected_dataset_meta = ""
 _PROCESS_THREAD_STARTED = False
 _PROCESS_LOCK = threading.Lock()
+_train_runner_process = None
+_train_runner_config = None
+_train_runner_lock = threading.Lock()
 
 # timing diagnostics similar to ESP32 implementation
 previousTransmit = 0
@@ -201,6 +204,109 @@ def _apply_dataset_selection(dataset_key: str = "", dataset_bin: str = "", datas
     _LOG.info('Selected dataset key=%s x_train=%s y_train=%s', _selected_dataset_key, resolved_bin, resolved_meta)
 
 
+def _normalize_config(cfg) -> dict:
+    if cfg is None:
+        return {}
+    return {
+        'layers': list(cfg.get('layers', [10, 10])),
+        'activation_functions': list(cfg.get('actvFunctions', cfg.get('activation_functions', [0, 0]))),
+        'epochs': int(cfg.get('epochs', 1)),
+        'random_seed': int(cfg.get('randomSeed', cfg.get('random_seed', 10))),
+        'learning_rate_of_weights': float(cfg.get('learningRateOfWeights', cfg.get('learning_rate_of_weights', 0.3333))),
+        'learning_rate_of_biases': float(cfg.get('learningRateOfBiases', cfg.get('learning_rate_of_biases', 0.0666))),
+        'json_weights': bool(cfg.get('jsonWeights', cfg.get('json_weights', False)))
+    }
+
+
+def _terminate_train_runner():
+    global _train_runner_process, _train_runner_config
+    with _train_runner_lock:
+        if _train_runner_process is not None:
+            _LOG.info("Terminating persistent train_runner subprocess to free RAM.")
+            try:
+                if _train_runner_process.poll() is None:
+                    try:
+                        _train_runner_process.stdin.write(json.dumps({"command": "exit"}) + "\n")
+                        _train_runner_process.stdin.flush()
+                        _train_runner_process.wait(timeout=2)
+                    except Exception:
+                        _train_runner_process.terminate()
+                        _train_runner_process.wait(timeout=2)
+            except Exception as e:
+                _LOG.warning("Error terminating train_runner: %s", e)
+            finally:
+                _train_runner_process = None
+                _train_runner_config = None
+
+
+def _ensure_train_runner(cfg_dict) -> bool:
+    global _train_runner_process, _train_runner_config
+    normalized = _normalize_config(cfg_dict)
+    
+    with _train_runner_lock:
+        if _train_runner_process is not None:
+            if _train_runner_process.poll() is not None or _normalize_config(_train_runner_config) != normalized:
+                _LOG.info("Config changed or train_runner exited. Terminating old subprocess.")
+                try:
+                    if _train_runner_process.poll() is None:
+                        _train_runner_process.stdin.write(json.dumps({"command": "exit"}) + "\n")
+                        _train_runner_process.stdin.flush()
+                        _train_runner_process.wait(timeout=2)
+                except Exception:
+                    try:
+                        _train_runner_process.terminate()
+                    except Exception:
+                        pass
+                _train_runner_process = None
+                _train_runner_config = None
+
+        if _train_runner_process is None:
+            import subprocess
+            cmd = [
+                sys.executable,
+                '-m', 'atlantico_rpi.train_runner',
+                '--config-json', json.dumps(normalized),
+                '--persistent'
+            ]
+            _LOG.info("Spawning persistent train_runner subprocess: %s", cmd)
+            try:
+                process = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                
+                ready_line = process.stdout.readline().strip()
+                if ready_line != "READY":
+                    _LOG.error("Expected 'READY' from train_runner, got: %s", ready_line)
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+                    return False
+                
+                def log_stderr(proc):
+                    try:
+                        for line in proc.stderr:
+                            _LOG.info("[train_runner] %s", line.rstrip())
+                    except Exception:
+                        pass
+                
+                t = threading.Thread(target=log_stderr, args=(process,), daemon=True)
+                t.start()
+                
+                _train_runner_process = process
+                _train_runner_config = normalized
+                _LOG.info("Persistent train_runner subprocess is READY.")
+            except Exception as e:
+                _LOG.exception("Failed to spawn persistent train_runner: %s", e)
+                return False
+                
+        return True
+
+
 def _process_model_worker():
     """Daemon worker: when state==READY_TO_TRAIN it trains and serializes.
 
@@ -229,7 +335,6 @@ def _process_model_worker():
                 time.sleep(0.5)
                 continue
 
-            import subprocess
             from atlantico_rpi.model_util import MultiClassClassifierMetrics, ClassClassifierMetrics
 
             # Serialize config to JSON to pass to subprocess
@@ -242,38 +347,81 @@ def _process_model_worker():
                 'learning_rate_of_biases': float(cfg.learning_rate_of_biases),
                 'json_weights': bool(cfg.json_weights)
             }
-            cfg_json = json.dumps(cfg_dict)
 
-            # Temp paths for weights and metrics
-            os.makedirs(_RAW_MODEL_DIR, exist_ok=True)
-            temp_weights_path = os.path.join(_RAW_MODEL_DIR, f"tmp_weights_{int(time.time())}_{uuid.uuid4().hex}.nn")
-            temp_metrics_path = os.path.join(_RAW_MODEL_DIR, f"tmp_metrics_{int(time.time())}_{uuid.uuid4().hex}.json")
-
-            cmd = [
-                sys.executable,
-                '-m', 'atlantico_rpi.train_runner',
-                '--x-file', X_TRAIN_PATH,
-                '--y-file', Y_TRAIN_PATH,
-                '--config-json', cfg_json,
-                '--output-metrics', temp_metrics_path,
-                '--output-weights', temp_weights_path
-            ]
-
-            _LOG.info('process_model: starting training in subprocess')
-            proc_start = time.time()
-            res = subprocess.run(cmd, capture_output=True, text=True)
-            proc_duration = time.time() - proc_start
-
-            if res.returncode != 0:
-                _LOG.error('process_model: training subprocess failed with code %d', res.returncode)
-                _LOG.error('process_model: stdout: %s', res.stdout)
-                _LOG.error('process_model: stderr: %s', res.stderr)
+            # Ensure train runner is running with the target config
+            if not _ensure_train_runner(cfg_dict):
+                _LOG.error('process_model: failed to start train runner subprocess')
                 _new_model_state = MODEL_IDLE
                 save_device_config()
                 time.sleep(0.5)
                 continue
 
-            _LOG.info('process_model: training subprocess finished successfully in %.2fs', proc_duration)
+            # Temp paths for weights and metrics
+            os.makedirs(_RAW_MODEL_DIR, exist_ok=True)
+            client_suffix = getattr(_MQTT_CLIENT, 'client_id', 'atlantico-pi')
+            temp_weights_path = os.path.join(_RAW_MODEL_DIR, f"tmp_weights_{int(time.time())}_{uuid.uuid4().hex}.nn")
+            temp_metrics_path = os.path.join(_RAW_MODEL_DIR, f"tmp_metrics_{int(time.time())}_{uuid.uuid4().hex}.json")
+
+            # Check if input weights exist (from the model event)
+            input_weights_path = os.path.join(_RAW_MODEL_DIR, f"latest-{client_suffix}.nn")
+            if not os.path.exists(input_weights_path):
+                input_weights_path = "None"
+
+            # Command: JSON serialized train action
+            cmd_payload = {
+                "command": "train",
+                "x_file": X_TRAIN_PATH,
+                "y_file": Y_TRAIN_PATH,
+                "weights_in": input_weights_path,
+                "weights_out": temp_weights_path,
+                "metrics_out": temp_metrics_path
+            }
+            cmd_line = json.dumps(cmd_payload) + "\n"
+            _LOG.info('process_model: sending command to persistent subprocess: %s', cmd_line.strip())
+
+            proc_start = time.time()
+            success = False
+            error_msg = ""
+            
+            with _train_runner_lock:
+                if _train_runner_process is not None and _train_runner_process.poll() is None:
+                    try:
+                        _train_runner_process.stdin.write(cmd_line)
+                        _train_runner_process.stdin.flush()
+                        
+                        response = _train_runner_process.stdout.readline().strip()
+                        proc_duration = time.time() - proc_start
+                        
+                        if response == "DONE":
+                            success = True
+                            _LOG.info('process_model: training finished successfully in %.2fs', proc_duration)
+                        elif response.startswith("ERROR"):
+                            error_msg = response
+                            _LOG.error('process_model: training failed: %s', response)
+                        else:
+                            error_msg = f"Unexpected response: {response}"
+                            _LOG.error('process_model: got unexpected response from train_runner: %s', response)
+                            _terminate_train_runner()
+                    except Exception as e:
+                        _LOG.exception('process_model: failed to write/read from train_runner subprocess')
+                        _terminate_train_runner()
+                        error_msg = str(e)
+                else:
+                    error_msg = "Subprocess not running"
+
+            # If we used the weights file, let's delete it so next rounds must wait for a new model.* event
+            if input_weights_path != "None" and os.path.exists(input_weights_path):
+                try:
+                    os.remove(input_weights_path)
+                    _LOG.info('process_model: deleted used input model file: %s', input_weights_path)
+                except Exception as e:
+                    _LOG.warning('process_model: failed to delete used input model file: %s', e)
+
+            if not success:
+                _new_model_state = MODEL_IDLE
+                save_device_config()
+                time.sleep(0.5)
+                continue
 
             # Load metrics
             metrics = None
@@ -321,7 +469,6 @@ def _process_model_worker():
             raw_path = temp_weights_path if os.path.exists(temp_weights_path) else None
 
             try:
-                # time.sleep(60) # delay to allow ESP32 catch up a bit
                 send_model_to_network(None, metrics, raw_model_path=raw_path)
                 _LOG.info('process_model: sent model to network')
             except Exception:
@@ -479,11 +626,23 @@ def loop(timeout: float = 0.1) -> None:
             _current_round = -1
             save_device_config()
             send_command('leave')
+            _terminate_train_runner()
             return
 
         if cmd in ('federate_start', 'start'):
             if _cfg.DISABLE_FEDERATION:
                 return
+            
+            # Clean up old latest weights file on start to ensure we don't reuse stale weights
+            client_suffix = getattr(_MQTT_CLIENT, 'client_id', 'atlantico-pi')
+            filename = os.path.join(_RAW_MODEL_DIR, f"latest-{client_suffix}.nn")
+            if os.path.exists(filename):
+                try:
+                    os.remove(filename)
+                    _LOG.info('Deleted old latest weights file on start: %s', filename)
+                except Exception:
+                    pass
+
             cfg = data.get('config')
             dataset_key = data.get('database') or data.get('dataset') or data.get('datasetKey') or ""
             dataset_bin = data.get('datasetBin') or ""

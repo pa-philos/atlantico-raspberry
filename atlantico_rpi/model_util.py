@@ -208,8 +208,118 @@ class ModelUtil:
 
         return self._train_on_data(X, y)
 
+    def build_keras_model(self) -> Any:
+        """Compile and cache Keras model based on config."""
+        _lazy_import_tf()
+        if tf is None:
+            return None
+        keras = getattr(tf, 'keras', None)
+        if keras is None:
+            return None
+
+        model_tf = keras.Sequential()
+        cfg_layers = getattr(self.config, 'layers', None) or [10, 10]
+        arch = [int(x) for x in cfg_layers]
+        input_dim = arch[0]
+        model_tf.add(keras.Input(shape=(input_dim,)))
+
+        # Map numeric activation codes to Keras activations or special markers
+        ACT_MAP = {
+            0: 'sigmoid',
+            1: 'tanh',
+            2: 'relu',
+            3: 'leaky',   # special-case: keras.layers.LeakyReLU
+            4: 'elu',
+            5: 'selu',
+            6: 'softmax',
+        }
+
+        act_codes = list(getattr(self.config, 'activation_functions', []) or [])
+        num_dense = len(arch) - 1
+        for i in range(num_dense):
+            units = int(arch[i + 1])
+            code = act_codes[i] if i < len(act_codes) else 2
+            act = ACT_MAP.get(int(code), 'linear')
+
+            if act == 'leaky':
+                model_tf.add(keras.layers.Dense(units))
+                model_tf.add(keras.layers.LeakyReLU(alpha=0.2))
+            else:
+                model_tf.add(keras.layers.Dense(units, activation=act))
+
+        # Choose loss: categorical_crossentropy for one-hot targets (classes > 1), else mse
+        if arch[-1] > 1:
+            loss = 'categorical_crossentropy'
+        else:
+            loss = 'mse'
+
+        model_tf.compile(optimizer=keras.optimizers.Adam(learning_rate=0.01), loss=loss)
+        self._last_trained_tf_model = model_tf
+        return model_tf
+
+    def set_keras_model_weights(self, keras_model: Any, weights_source: Any) -> bool:
+        """Load weights into Keras model's Dense layers from bytes (ESP32 layout) or Model object."""
+        _lazy_import_tf()
+        if tf is None:
+            return False
+        keras = getattr(tf, 'keras', None)
+        if keras is None:
+            return False
+
+        dense_layers = [l for l in keras_model.layers if isinstance(l, keras.layers.Dense)]
+
+        if isinstance(weights_source, (bytes, bytearray)):
+            parsed = self._parse_nn_bytes(bytes(weights_source))
+            if not parsed:
+                _LOG.warning("Failed to parse weights bytes.")
+                return False
+
+            if len(dense_layers) != len(parsed['layers']):
+                _LOG.warning(
+                    "Keras Dense layer count (%d) does not match parsed .nn layer count (%d)",
+                    len(dense_layers), len(parsed['layers'])
+                )
+                return False
+
+            for idx, layer in enumerate(dense_layers):
+                parsed_layer = parsed['layers'][idx]
+                w = parsed_layer['weights']  # shape: (outputs, inputs)
+                b = parsed_layer['biases']   # shape: (outputs,)
+                layer.set_weights([w.T, b])
+            _LOG.info("Loaded weights from bytes into Keras model layers successfully.")
+            return True
+
+        elif isinstance(weights_source, Model):
+            biases_flat = list(weights_source.biases or [])
+            weights_flat = list(weights_source.weights or [])
+            
+            b_idx = 0
+            w_idx = 0
+            for layer in dense_layers:
+                curr_w, curr_b = layer.get_weights()
+                inputs, outputs = curr_w.shape
+                
+                b_slice = biases_flat[b_idx : b_idx + outputs]
+                b_idx += outputs
+                if len(b_slice) < outputs:
+                    b_slice = b_slice + [0.0] * (outputs - len(b_slice))
+                
+                num_elements = inputs * outputs
+                w_slice = weights_flat[w_idx : w_idx + num_elements]
+                w_idx += num_elements
+                if len(w_slice) < num_elements:
+                    w_slice = w_slice + [0.0] * (num_elements - len(w_slice))
+                
+                w_arr = np.array(w_slice, dtype=np.float32).reshape((outputs, inputs)).T
+                b_arr = np.array(b_slice, dtype=np.float32)
+                layer.set_weights([w_arr, b_arr])
+            _LOG.info("Loaded weights from Model object into Keras model layers successfully.")
+            return True
+
+        return False
+
     def _train_on_data(self, X: np.ndarray, y: np.ndarray) -> MultiClassClassifierMetrics:
-        """Internal: Train a fresh model on X, y using current config."""
+        """Internal: Train the compiled cached model on X, y using current config."""
         _lazy_import_tf()
         metrics = MultiClassClassifierMetrics()
         metrics.parsingTime = 0
@@ -225,84 +335,12 @@ class ModelUtil:
             _LOG.debug('TensorFlow keras not available despite tf import; returning placeholder metrics')
             return metrics
 
-        # Clear any old Keras models from memory and invoke garbage collection
-        # to prevent memory leaks across multiple federated learning rounds.
-        keras.backend.clear_session()
-        import gc
-        gc.collect()
-        self._last_trained_tf_model = None
-
-        model_tf = keras.Sequential()
-        input_dim = X.shape[1]
-        model_tf.add(keras.Input(shape=(input_dim,)))
-
-        # Map numeric activation codes to Keras activations or special markers
-        ACT_MAP = {
-            0: 'sigmoid',
-            1: 'tanh',
-            2: 'relu',
-            3: 'leaky',   # special-case: keras.layers.LeakyReLU
-            4: 'elu',
-            5: 'selu',
-            6: 'softmax',
-        }
-
-        # Determine architecture: accept full-arch (including input) or hidden+output sizes
-        cfg_layers = getattr(self.config, 'layers', None) or []
-        if isinstance(cfg_layers, (list, tuple)) and len(cfg_layers) >= 2:
-            arch = [int(x) for x in cfg_layers]
-            if int(cfg_layers[0]) != int(input_dim):
-                _LOG.warning(
-                    "Input data dim %s does not match config `layers[0]` %s. Replacing the input layer size with the dataset width.",
-                    input_dim,
-                    cfg_layers[0],
-                )
-                arch[0] = int(input_dim)
-        else:
-            arch = [int(input_dim)] + [int(x) for x in (getattr(self.config, 'layers') or [10, 10])]
-
-        # If targets are provided as one-hot vectors, ensure the final
-        # layer's number of outputs matches the number of classes. This
-        # prevents Keras from raising a shape mismatch when using
-        # categorical_crossentropy.
-        if y.ndim > 1 and y.shape[1] > 1:
-            try:
-                required_outputs = int(y.shape[1])
-                if arch[-1] != required_outputs:
-                    _LOG.info(
-                        "Adjusting final layer units from %s to %s to match one-hot targets",
-                        arch[-1], required_outputs,
-                    )
-                    arch[-1] = required_outputs
-            except Exception:
-                # If anything goes wrong determining output size, prefer
-                # to continue and let Keras raise an explicit error later.
-                pass
-
-        act_codes = list(getattr(self.config, 'activation_functions', []) or [])
-        num_dense = len(arch) - 1
-        for i in range(num_dense):
-            units = int(arch[i + 1])
-            code = act_codes[i] if i < len(act_codes) else 2
-            act = ACT_MAP.get(int(code), 'linear')
-
-            # Prefer softmax for final layer when targets are one-hot
-            if i == num_dense - 1 and y.ndim > 1 and y.shape[1] > 1:
-                act = 'softmax'
-
-            if act == 'leaky':
-                model_tf.add(keras.layers.Dense(units))
-                model_tf.add(keras.layers.LeakyReLU(alpha=0.2))
-            else:
-                model_tf.add(keras.layers.Dense(units, activation=act))
-
-        # Choose loss: categorical_crossentropy for one-hot targets, else mse
-        if y.ndim > 1 and y.shape[1] > 1:
-            loss = 'categorical_crossentropy'
-        else:
-            loss = 'mse'
-
-        model_tf.compile(optimizer=keras.optimizers.Adam(learning_rate=0.01), loss=loss)
+        model_tf = self._last_trained_tf_model
+        if model_tf is None:
+            model_tf = self.build_keras_model()
+            if model_tf is None:
+                _LOG.error("Failed to build Keras model in _train_on_data")
+                return metrics
 
         if hasattr(tf, 'timestamp'):
             start = tf.timestamp()
@@ -318,14 +356,13 @@ class ModelUtil:
 
         metrics.trainingTime = float(end - start)
 
-        # Intentionally let assignment failures surface.
         self._last_trained_tf_model = model_tf
 
         metrics.meanSqrdError = float(history.history.get('loss', [0])[-1])
 
         # Predictions and classification metrics: convert softmax/prob vectors
         # to class labels via argmax for multi-class, otherwise threshold.
-        preds = model_tf.predict(X)
+        preds = model_tf.predict(X, verbose=0)
         if preds.ndim > 1 and preds.shape[1] > 1:
             y_pred_labels = np.argmax(preds, axis=1)
         else:
