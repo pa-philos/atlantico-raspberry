@@ -76,35 +76,41 @@ def _sanitize_dataset_key(raw_key: str) -> str:
     return key
 
 
-def _find_bin_file_in_dataset_folder(dataset_key: str) -> str:
+def _find_bin_file_in_dataset_folder(dataset_key: str, base_dir: Optional[str] = None) -> str:
     key = _sanitize_dataset_key(dataset_key)
     if not key:
         return ""
 
-    # Search in multiple potential locations
-    candidates = [
-        os.path.join(".", key),
-        os.path.join("data_juliana", key),
-        os.path.join("data_ready_dataset_new", key),
-    ]
-    
     folder = ""
-    for c in candidates:
-        if os.path.isdir(c):
-            folder = c
-            break
-    
+    if base_dir and os.path.isdir(base_dir):
+        folder = base_dir
+
     if not folder:
-        # try searching for the key as a folder name anywhere under data directories
-        for root_dir in ['.', 'data_juliana', 'data_ready_dataset_new', 'data_ready']:
-            if not os.path.isdir(root_dir):
-                continue
-            for entry in os.scandir(root_dir):
-                if entry.is_dir() and entry.name == key:
-                    folder = entry.path
-                    break
-            if folder:
+        # Search in multiple potential locations
+        data_dir = getattr(_cfg, 'DATA_DIR', '.')
+        candidates = [
+            os.path.join(data_dir, key),
+            os.path.join(".", key),
+            os.path.join("data_juliana", key),
+            os.path.join("data_ready_dataset_new", key),
+        ]
+        
+        for c in candidates:
+            if os.path.isdir(c):
+                folder = c
                 break
+        
+        if not folder:
+            # try searching for the key as a folder name anywhere under data directories
+            for root_dir in ['.', 'data_juliana', 'data_ready_dataset_new', 'data_ready']:
+                if not os.path.isdir(root_dir):
+                    continue
+                for entry in os.scandir(root_dir):
+                    if entry.is_dir() and entry.name == key:
+                        folder = entry.path
+                        break
+                if folder:
+                    break
     
     if not folder:
         return ""
@@ -175,7 +181,7 @@ def _apply_dataset_selection(dataset_key: str = "", dataset_bin: str = "", datas
     resolved_bin = os.path.join(base_dir, bin_name)
     bin_folder = base_dir
     if not os.path.exists(resolved_bin):
-        fallback_bin = _find_bin_file_in_dataset_folder(_selected_dataset_key)
+        fallback_bin = _find_bin_file_in_dataset_folder(_selected_dataset_key, base_dir)
         if fallback_bin:
             _LOG.info('Dataset bin not found at %s; using fallback %s', resolved_bin, fallback_bin)
             resolved_bin = fallback_bin
